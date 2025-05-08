@@ -1,0 +1,21 @@
+# Environnement virtuel
+.venv/
+lime_env/
+
+# Fichiers temporaires et cache
+__pycache__/
+*.pyc
+*.pyo
+*.tmp
+*.log
+*.wav
+
+# Fichiers de poids lourds / modèles / dépendances locales
+llama-2-7b-chat.Q4_K_M.gguf
+*.whl
+
+# Config locales et gradio
+.gradio/
+
+# Variables d’environnement
+.env

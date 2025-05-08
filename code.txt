@@ -1,0 +1,381 @@
+import gradio as gr
+import sounddevice as sd
+import numpy as np
+import cv2
+import time
+import os
+os.environ['GLOG_minloglevel'] = '2'  # Cache les logs info/debug de MediaPipe
+import mediapipe as mp
+from deepface import DeepFace
+from transformers import AutoProcessor, AutoModelForAudioClassification
+from llama_cpp import Llama
+import pyttsx3
+import torch
+import speech_recognition as sr
+import soundfile as sf
+from transformers import pipeline
+import json 
+
+
+print("Initialisation de MediaPipe FaceMesh...")
+# Initialisation des modèles
+#mp_face_mesh = mp.solutions.face_mesh.FaceMesh(
+ #   max_num_faces=1,
+  #  refine_landmarks=True,
+   # min_detection_confidence=0.7,
+    #static_image_mode=False
+#)
+print("MediaPipe FaceMesh initialisé avec succès.")
+
+
+llm = Llama(
+    model_path="llama-2-7b-chat.Q4_K_M.gguf",
+    n_ctx=2048,
+    n_threads=6,
+    n_batch=512,
+    verbose=False
+)
+
+# Chargez Wav2Vec2 avec la nouvelle API
+try:
+    audio_processor = AutoProcessor.from_pretrained("facebook/wav2vec2-large-robust-ft-swbd-300h")
+    audio_model = AutoModelForAudioClassification.from_pretrained("facebook/wav2vec2-large-robust-ft-swbd-300h")
+except Exception as e:
+    print(f"Erreur chargement Wav2Vec2: {e}")
+    # Fallback
+    audio_processor, audio_model = None, None
+
+# Transcription avec Whisper
+try:
+    transcriber = pipeline("automatic-speech-recognition", model="openai/whisper-base")
+except Exception as e:
+    print(f"Erreur chargement Whisper: {e}")
+    transcriber = None
+
+
+"""
+def transcribe_audio(audio_data):
+    
+    r = sr.Recognizer()
+    try:
+        # Sauvegarde temporaire du fichier audio
+        with open("temp.wav", "wb") as f:
+            sf.write(f, audio_data, 16000)
+        
+        with sr.AudioFile("temp.wav") as source:
+            audio = r.record(source)
+        return r.recognize_google(audio, language="fr-FR")
+    except Exception as e:
+        print(f"Erreur transcription: {e}")
+        return ""
+"""
+
+
+def analyze_response(question, transcription, job_title="Développeur"):
+    if not transcription.strip():
+        return {
+            "score": 0,
+            "points_forts": [],
+            "points_faibles": []
+        }
+
+    prompt = f"""
+Tu joues le rôle d'un recruteur expert. Voici une question d'entretien pour un poste de {job_title} :
+Question : "{question}"
+
+Et voici la réponse du candidat :
+"{transcription}"
+
+Analyse cette réponse. Fournis le résultat **au format JSON** exactement comme ci-dessous :
+
+{{
+  "score": <note sur 10>,
+  "points_forts": ["<point fort 1>", "<point fort 2>", ...],
+  "points_faibles": ["<point faible 1>", "<point faible 2>", ...]
+}}
+
+Seulement le JSON, sans commentaire.
+    """
+
+    try:
+        raw_output = llm(prompt=prompt)['choices'][0]['text']
+        print("🧠 [DEBUG] Output brut LLM =", raw_output.strip())
+
+        # Tente d'extraire le JSON même si le modèle parle autour
+        start = raw_output.find("{")
+        end = raw_output.rfind("}") + 1
+        json_str = raw_output[start:end]
+        parsed = json.loads(json_str)
+
+        # Sanitize les listes
+        def sanitize_list(lst):
+            return [str(item) if not isinstance(item, str) else item for item in lst]
+
+        score = parsed.get("score", 0)
+        if isinstance(score, str):
+            try:
+                score = float(score)
+            except ValueError:
+                score = 0
+
+        return {
+            "score": score,
+            "points_forts": sanitize_list(parsed.get("points_forts", [])),
+            "points_faibles": sanitize_list(parsed.get("points_faibles", []))
+        }
+
+    except Exception as e:
+        print("❌ Erreur analyse réponse:", e)
+        print("Raw output was:\n", raw_output)
+        return {
+            "score": 0,
+            "points_forts": [],
+            "points_faibles": []
+        }
+
+
+
+
+
+
+def generate_question():
+    prompt = """Tu es un intervieweur technique strict. Génère UNIQUEMENT une question technique en français 
+    sans aucun commentaire, contexte ou réponse. Format exigé : 'Question sur [sujet technique] ?' 
+    
+    Voici des exemples valides :
+    - 'Comment optimiseriez-vous une requête SQL ?'
+    - 'Expliquez le principe du MVC ?'
+    
+    Génère maintenant une question technique :"""
+    
+    response = llm(
+        prompt,
+        max_tokens=50,  # Réduit pour éviter les textes trop longs
+        temperature=0.5,  # Moins de créativité pour plus de précision
+        stop=["\n", "Réponse:", "Explication:"]  # Arrête la génération précocement
+    )
+    
+    # Nettoyage strict de la sortie
+    question = response['choices'][0]['text'].strip()
+    if not question.endswith('?'):
+        question = question.split('?')[0] + '?'  # Garantit la fin par un ?
+    
+    # Filtre les phrases non-questions
+    if any(q_word in question.lower() for q_word in ['réponse', 'explication', 'commentaire']):
+        question = "Parlez-moi d'un projet technique que vous avez mené ?"  # Question fallback
+    
+    return question
+
+def analyze_face(frame):
+    try:
+        with mp.solutions.face_mesh.FaceMesh(
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.7,
+            static_image_mode=False
+        ) as mp_face_mesh:
+            results = mp_face_mesh.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            landmarks = []
+            if results.multi_face_landmarks:
+                landmarks = [(lm.x, lm.y) for lm in results.multi_face_landmarks[0].landmark]
+
+            emotions = DeepFace.analyze(frame, actions=['emotion'], detector_backend='mtcnn')[0]
+            return "Visage analysé avec succès ✅"
+            """return {
+                "landmarks": len(landmarks),
+                "emotion": emotions['dominant_emotion'],
+                "confidence": float(emotions['emotion'][emotions['dominant_emotion']])
+            }"""
+    except Exception as e:
+        print(f"Erreur analyse faciale: {e}")
+        return "Analyse visuelle indisponible."
+
+
+
+def analyze_audio(audio_data):
+    if audio_processor is None:
+        return {"emotion": "neutral", "confidence": 0.5}
+    
+    try:
+        inputs = audio_processor(
+            audio_data,
+            sampling_rate=16000,
+            return_tensors="pt",
+            padding=True
+        )
+        with torch.no_grad():
+            outputs = audio_model(**inputs)
+        return {
+            "emotion": "happy" if outputs.logits[0][1] > 0 else "neutral",
+            "confidence": float(outputs.logits.softmax(dim=1)[0][1])
+        }
+    except Exception as e:
+        print(f"Erreur analyse audio: {e}")
+        return {"error": str(e)}
+    
+def transcribe_audio(audio_data):
+    """Convertit l'audio en texte, debug prints inclus."""
+    if transcriber is None:
+        print("❌ Transcriber non initialisé.")
+        return "Transcription non disponible"
+    try:
+        audio_np = np.array(audio_data, dtype=np.float32)
+        print(f"🔍 [DEBUG] audio_np.shape = {audio_np.shape}, dtype = {audio_np.dtype}")
+        duration_s = len(audio_np) / 16000
+        print(f"🔍 [DEBUG] Durée de l'audio = {duration_s:.2f} s")
+        if duration_s < 1.0:
+            print("⚠️ [DEBUG] Audio trop court (<1 s) pour une bonne transcription.")
+        
+        # ⚠️ Retiré sampling_rate
+        result = transcriber(audio_np)
+        print(f"✅ [DEBUG] transcription brute = {result['text']}")
+        return result["text"]
+    except Exception as e:
+        print(f"❌ Erreur transcription: {e}")
+        return "Erreur lors de la transcription"
+
+
+
+def analyze_response_text(response_text):
+    prompt = f"""Voici une réponse donnée à une question d'entretien :
+"{response_text}"
+Analyse cette réponse en identifiant les points forts, les faiblesses, et donne un score sur 10.
+Réponds sous forme d'objet JSON avec les champs :
+"score", "points_forts", "points_faibles"."""
+
+    try:
+        res = llm(prompt, max_tokens=300, temperature=0.7)
+        output_text = res['choices'][0]['text']
+        return eval(output_text)
+    except Exception as e:
+        print(f"Erreur analyse réponse: {e}")
+        return {
+            "score": 0,
+            "points_forts": [],
+            "points_faibles": ["Analyse indisponible"]
+        }
+
+def process_response(audio_data, question, job_title="Développeur"):
+    transcription = transcribe_audio(audio_data)
+    analysis = analyze_response(question, transcription, job_title)
+    return transcription, analysis
+
+
+def speak(text):
+    try:
+        engine = pyttsx3.init()
+        engine.say(text)
+        engine.runAndWait()
+    except Exception as e:
+        print(f"Erreur synthèse vocale: {e}")
+
+# ... (vos imports restent identiques)
+
+    # LA FONCTION DOIT ÊTRE DÉFINIE AVANT DE L'UTILISER
+def run_interview():
+    try:
+        # Génération question
+        q = generate_question()
+        speak(q)
+        yield None, q, "Question posée (60s pour répondre)", None, None
+        
+        # Capture audio/vidéo
+        audio_data = sd.rec(int(60 * 16000), samplerate=16000, channels=1)
+        cap = cv2.VideoCapture(0)
+        frames = []
+        
+        for i in range(60):
+            ret, frame = cap.read()
+            if ret:
+                frames.append(frame)
+                yield frame, q, f"Temps restant: {59 - i}s", None, None
+                time.sleep(1)
+        
+        # Analyses
+        face_result = analyze_face(frames[-1])
+        audio_result = analyze_audio(audio_data.flatten())
+        
+        # NOUVEAU: Analyse de la réponse
+        transcription, content_analysis = process_response(audio_data.flatten(), q, "Développeur")
+        
+        # Nettoyage pour affichage lisible
+        face_summary = face_result if isinstance(face_result, str) else "Analyse visuelle indisponible."
+        audio_summary = f"Émotion détectée: {audio_result.get('emotion', 'inconnue')} (Confiance: {round(audio_result.get('confidence', 0)*100)}%)"
+        reponse_summary = f"Transcription: {transcription[:100]}...\n"
+        if content_analysis and isinstance(content_analysis, dict):
+            reponse_summary += f"Score: {content_analysis.get('score', 0)}\n"
+            reponse_summary += f"Points forts: {', '.join(content_analysis.get('points_forts', [])) or 'Aucun'}\n"
+            reponse_summary += f"Points faibles: {', '.join(content_analysis.get('points_faibles', [])) or 'Aucun'}"
+        else:
+            reponse_summary += "Analyse du contenu indisponible."
+
+        # Tout ce qu'on affiche à la fin
+        resume_json = {
+    "audio": audio_summary,
+    "face": face_summary,
+    "reponse": reponse_summary
+}
+
+        yield frames[-1], q, "Analyse terminée", resume_json, transcription
+
+
+
+        
+    except Exception as e:
+        print(f"Erreur globale: {e}")
+        yield None, "Erreur", str(e), None, None
+
+with gr.Blocks(theme=gr.themes.Soft()) as demo:
+    gr.Markdown("## 🤖 Interview Technique")
+    
+    with gr.Row():
+        webcam = gr.Image(label="Webcam Live", width=640)
+        with gr.Column():
+            question = gr.Textbox(label="Question", lines=3)
+            with gr.Accordion("Résultats détaillés", open=False):
+                results = gr.JSON(label="Analyse complète")
+                transcription_box = gr.Textbox(label="Transcription", interactive=False)
+            status = gr.Textbox(label="Statut")        
+
+        gr.Button("Démarrer l'interview").click(
+    run_interview,
+    outputs=[webcam, question, status, results, transcription_box]
+)
+
+
+
+
+demo.launch(share=False)
+
+
+*****************************************************************
+
+
+
+def generate_question():
+    prompt = """Tu es un intervieweur technique strict. Génère UNIQUEMENT une question technique en français 
+    sans aucun commentaire, contexte ou réponse. Format exigé : 'Question sur [sujet technique] ?' 
+    
+    Voici des exemples valides :
+    - 'Comment optimiseriez-vous une requête SQL ?'
+    - 'Expliquez le principe du MVC ?'
+    
+    Génère maintenant une question technique :"""
+    
+    response = llm(
+        prompt,
+        max_tokens=50,  # Réduit pour éviter les textes trop longs
+        temperature=0.5,  # Moins de créativité pour plus de précision
+        stop=["\n", "Réponse:", "Explication:"]  # Arrête la génération précocement
+    )
+    
+    # Nettoyage strict de la sortie
+    question = response['choices'][0]['text'].strip()
+    if not question.endswith('?'):
+        question = question.split('?')[0] + '?'  # Garantit la fin par un ?
+    
+    # Filtre les phrases non-questions
+    if any(q_word in question.lower() for q_word in ['réponse', 'explication', 'commentaire']):
+        question = "Parlez-moi d'un projet technique que vous avez mené ?"  # Question fallback
+    
+    return question
